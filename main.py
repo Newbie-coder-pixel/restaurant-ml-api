@@ -48,6 +48,8 @@ class PredictResponse(BaseModel):
 
 
 class RetrainResponse(BaseModel):
+    model_config = {"protected_namespaces": ()}
+
     status:        str
     samples_used:  int
     mae_minutes:   float
