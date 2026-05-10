@@ -21,7 +21,12 @@ app = FastAPI(title="Prep Time Prediction API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://restaurantmanagement-weld.vercel.app"],
+    allow_origins=[
+        "https://restaurantmanagement-weld.vercel.app",
+        "https://restaurant-qr-code-ten.vercel.app",
+        "https://restaurant-staff-topaz.vercel.app",
+        "https://restaurant-customer-two.vercel.app",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
