@@ -317,6 +317,10 @@ def _build_training_df(supabase, branch_id: str | None = None) -> pd.DataFrame:
             ).sum(),
             "hour_of_day":           grp["order_created_at"].iloc[0].hour
                                      if grp["order_created_at"].iloc[0] is not pd.NaT else 12,
+            # Rentang waktu order ini benar-benar ada di dapur — dipakai untuk
+            # menghitung queue_length historis (order lain yang overlap rentang ini).
+            "order_start":           grp["sent_to_kitchen_at"].min(),
+            "order_end":             grp["prepared_at"].max(),
             # actual = waktu sejak item pertama masuk dapur sampai semua siap
             "actual_prep_minutes":   (
                 grp["prepared_at"].max() - grp["sent_to_kitchen_at"].min()
@@ -325,11 +329,20 @@ def _build_training_df(supabase, branch_id: str | None = None) -> pd.DataFrame:
 
     df_orders = df_raw.groupby("order_id").apply(agg_order).reset_index(drop=True)
 
-    # ── Tambah queue_length per order dari data historis ─────────────────────
-    # Approximasi: query berapa order lain yang sedang 'preparing' saat order ini masuk.
-    # Untuk retrain kita pakai nilai median sebagai fallback karena
-    # data historis queue tidak tersimpan per-order.
-    df_orders["queue_length"] = 3  # median approximation untuk data historis
+    # ── Hitung queue_length historis yang sebenarnya ──────────────────────────
+    # queue_length = jumlah order LAIN yang sudah masuk dapur (order_start <= t)
+    # tapi belum selesai (order_end > t) tepat saat order ini mulai dimasak.
+    # Ini meniru definisi queue_length yang sama persis dipakai saat /predict
+    # ("jumlah order berstatus 'preparing' saat ini"). Sebelumnya nilai ini
+    # di-hardcode ke 3 untuk semua baris, sehingga fitur ini konstan dan model
+    # tidak pernah bisa belajar efek antrian dari data real sama sekali.
+    starts = df_orders["order_start"].to_numpy()
+    ends   = df_orders["order_end"].to_numpy()
+    # matrix[i, j] = True jika order j masih 'preparing' saat order i mulai dimasak
+    still_preparing = (starts[None, :] <= starts[:, None]) & (ends[None, :] > starts[:, None])
+    queue_lengths = still_preparing.sum(axis=1) - 1  # -1 = jangan hitung order itu sendiri
+    df_orders["queue_length"] = np.clip(queue_lengths, 0, None)
+    df_orders = df_orders.drop(columns=["order_start", "order_end"])
 
     # Buang outlier final
     df_orders = df_orders[
@@ -357,13 +370,26 @@ def predict(req: PredictRequest):
         1 for i in req.items
         if i.special_requests and i.special_requests.strip() != ""
     )
+    raw_weighted_prep = sum(i.preparation_time_minutes * i.quantity for i in req.items)
 
-    # ── Terapkan equipment_factor ─────────────────────────────────────────────
-    # weighted_prep_time dikalikan equipment_factor sebelum masuk model.
-    # Dapur dengan alat lebih canggih → factor < 1.0 → prep time lebih rendah.
-    equipment_factor   = _get_equipment_factor(req.branch_id)
-    raw_weighted_prep  = sum(i.preparation_time_minutes * i.quantity for i in req.items)
-    weighted_prep_time = round(raw_weighted_prep * equipment_factor, 2)
+    # ── Pilih model: branch-specific jika ada, fallback ke global ────────────
+    active_model, active_features, model_scope = _get_model_for_branch(req.branch_id)
+
+    # ── Terapkan equipment_factor HANYA saat memakai model global ────────────
+    # Kalau branch ini sudah punya model sendiri (dilatih dari actual_prep_minutes
+    # riil cabang tsb via /retrain), kecepatan dapur cabang itu SUDAH otomatis
+    # terkandung dalam model — actual_prep_minutes historisnya memang sudah
+    # mencerminkan dapur cepat/lambat itu. Mengalikan equipment_factor lagi di
+    # sini akan menghitung efek kecepatan dapur DUA KALI dan membuat prediksi
+    # bias (under-predict untuk dapur cepat, over-predict untuk dapur lambat).
+    # equipment_factor jadi relevan hanya sebagai adjustment manual saat masih
+    # memakai model global generik (belum ada cukup data real cabang tsb).
+    if model_scope == "global":
+        equipment_factor   = _get_equipment_factor(req.branch_id)
+        weighted_prep_time = round(raw_weighted_prep * equipment_factor, 2)
+    else:
+        equipment_factor   = 1.0
+        weighted_prep_time = round(raw_weighted_prep, 2)
 
     features = {
         "total_quantity":        total_quantity,
@@ -373,9 +399,6 @@ def predict(req: PredictRequest):
         "hour_of_day":           req.hour_of_day,
         "queue_length":          req.queue_length,
     }
-
-    # ── Pilih model: branch-specific jika ada, fallback ke global ────────────
-    active_model, active_features, model_scope = _get_model_for_branch(req.branch_id)
 
     X = pd.DataFrame([features])[active_features]
     predicted = active_model.predict(X)[0]
@@ -396,9 +419,10 @@ def predict(req: PredictRequest):
         breakdown={
             **features,
             # Info tambahan untuk debugging / transparansi di Flutter
-            "equipment_factor":   equipment_factor,
-            "raw_weighted_prep":  raw_weighted_prep,
-            "branch_id":          req.branch_id,
+            "equipment_factor":          equipment_factor,
+            "equipment_factor_applied":  model_scope == "global",
+            "raw_weighted_prep":         raw_weighted_prep,
+            "branch_id":                 req.branch_id,
             # Info buffer — berguna untuk UI "kenapa estimasi ini?" dan dokumentasi
             "model_prediction":     model_prediction,
             "buffer_multiplier":    buffer_multiplier,
