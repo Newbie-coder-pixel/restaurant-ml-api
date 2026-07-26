@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 model/
+model_old_synthetic_backup_kept/
 .venv/.env
 __pycache__/
 *.pyc
